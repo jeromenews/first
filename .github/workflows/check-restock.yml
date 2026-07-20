@@ -1,13 +1,27 @@
 name: Check Daydream Vinyl Restock
 
+# SELF-SCHEDULING VERSION.
+# GitHub's cron scheduler can be throttled/silent on brand-new accounts, so
+# instead of relying only on cron, this workflow runs a loop inside a single
+# job: check -> sleep 10 min -> check -> ... for up to ~5.5 hours, then it
+# re-triggers itself to continue the chain. The cron trigger is ALSO kept as
+# a backup: once GitHub un-throttles the account, cron will independently
+# restart the chain if it ever breaks.
+
 on:
   schedule:
-    # Every 10 minutes.
-    - cron: "*/10 * * * *"
-  workflow_dispatch: {}   # manual "Run workflow" button (also keeps it alive)
+    - cron: "0 */5 * * *"    # backup: every 5 hours, re-lights the chain if it ever dies
+  workflow_dispatch: {}      # manual start + how the chain re-triggers itself
 
 permissions:
-  contents: write         # needed so the job can save the lineup fingerprint
+  contents: write            # save the lineup fingerprint
+  actions: write             # allow the job to re-dispatch itself
+
+# Only one copy runs at a time. If cron and the self-chain overlap, the
+# newer one is queued and the older keeps going — no duplicate loops.
+concurrency:
+  group: restock-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -24,19 +38,35 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run restock check
+      - name: Loop — check every 10 minutes for ~5.5 hours
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python monitor.py
-
-      - name: Save updated lineup fingerprint
         run: |
-          if [ -n "$(git status --porcelain lineup_state.json)" ]; then
-            git config user.name "restock-bot"
-            git config user.email "restock-bot@users.noreply.github.com"
-            git add lineup_state.json
-            git commit -m "Update product lineup fingerprint"
-            git push
-          else
-            echo "No lineup change to commit."
-          fi
+          END=$(( $(date +%s) + 5*3600 + 1800 ))   # now + 5h30m
+          while [ "$(date +%s)" -lt "$END" ]; do
+            echo "----- check at $(date -u) -----"
+            python monitor.py || echo "monitor.py errored this cycle (continuing)"
+
+            # Commit the lineup fingerprint if it changed.
+            if [ -n "$(git status --porcelain lineup_state.json)" ]; then
+              git config user.name "restock-bot"
+              git config user.email "restock-bot@users.noreply.github.com"
+              git add lineup_state.json
+              git commit -m "Update product lineup fingerprint" || true
+              git pull --rebase --autostash || true
+              git push || echo "push failed this cycle (continuing)"
+            fi
+
+            echo "sleeping 10 minutes..."
+            sleep 600
+          done
+          echo "Loop window complete."
+
+      - name: Re-trigger the next chain link
+        if: always()   # even if the loop step errored, keep the chain alive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Re-dispatching the workflow to continue the chain..."
+          gh workflow run check-restock.yml --ref main \
+            || echo "Re-dispatch failed; the cron backup will restart the chain."
