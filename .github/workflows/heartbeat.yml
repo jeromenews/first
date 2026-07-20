@@ -1,0 +1,16 @@
+name: Heartbeat Test
+
+on:
+  schedule:
+    # Every 5 minutes — just to see if scheduled runs fire at all.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say when this ran
+        run: |
+          echo "Heartbeat ran at: $(date -u)"
+          echo "Triggered by event: ${{ github.event_name }}"
